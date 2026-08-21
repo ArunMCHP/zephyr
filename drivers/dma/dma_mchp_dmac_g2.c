@@ -26,6 +26,28 @@ LOG_MODULE_REGISTER(dma_mchp_dmac_g2, CONFIG_DMA_LOG_LEVEL);
 
 #define DMAC_REG ((const struct dma_mchp_dev_config *)(dev)->config)->regs
 
+/* GPIO Profiling for ISR timing measurement (use oscilloscope/logic analyzer)
+ * Set DMA_ISR_GPIO_PROFILING to 1 to enable, 0 to disable
+ * Configure the GPIO port and pin below
+ */
+#define DMA_ISR_GPIO_PROFILING 1
+
+#if DMA_ISR_GPIO_PROFILING
+/* Direct register access for minimal overhead (~2 cycles) */
+#define PROFILE_GPIO_PORT      PORT_REGS->GROUP[2]  /* PORTC */
+#define PROFILE_GPIO_PIN       0                     /* PC00 */
+#define PROFILE_GPIO_INIT()    do { \
+		PROFILE_GPIO_PORT.PORT_DIRSET = (1U << PROFILE_GPIO_PIN); \
+		PROFILE_GPIO_PORT.PORT_OUTCLR = (1U << PROFILE_GPIO_PIN); \
+	} while (0)
+#define PROFILE_GPIO_HIGH()    (PROFILE_GPIO_PORT.PORT_OUTSET = (1U << PROFILE_GPIO_PIN))
+#define PROFILE_GPIO_LOW()     (PROFILE_GPIO_PORT.PORT_OUTCLR = (1U << PROFILE_GPIO_PIN))
+#else
+#define PROFILE_GPIO_INIT()
+#define PROFILE_GPIO_HIGH()
+#define PROFILE_GPIO_LOW()
+#endif
+
 #define DMAC_BUF_ADDR_ALIGNMENT   4U
 #define DMAC_BUF_SIZE_ALIGNMENT   4U
 #define DMAC_COPY_ALIGNMENT       4U
@@ -356,11 +378,13 @@ static int dma_mchp_desc_setup(struct dma_mchp_dev_data *dev_data, struct dma_co
 }
 
 /* Channel Interrupt handling function */
-static void dma_mchp_handle_channel_int(const struct device *dev, uint32_t channel,
+static __always_inline void dma_mchp_handle_channel_int(const struct device *dev, uint32_t channel,
 					uint8_t ch_int_flag)
 {
 	struct dma_mchp_dev_data *dev_data = dev->data;
 	struct dma_mchp_channel_config *ch_cfg = &dev_data->dma_channel_config[channel];
+
+
 
 	if (ch_cfg->cb == NULL) {
 		return;
@@ -372,12 +396,14 @@ static void dma_mchp_handle_channel_int(const struct device *dev, uint32_t chann
 			ch_cfg->cb(dev, ch_cfg->user_data, channel, -EIO);
 		}
 	} else {
+		/* End GPIO profiling before callback (measure ISR code only) */
+		/* PROFILE_GPIO_LOW(); */  /* Commented - now in macro for find_lsb_set test */
 		ch_cfg->cb(dev, ch_cfg->user_data, channel, DMA_STATUS_COMPLETE);
 	}
 }
 
 /* ISR for dedicated IRQ line - one IRQ per channel */
-static void dma_mchp_isr_dedicated(const struct device *dev, uint32_t channel)
+static __always_inline void dma_mchp_isr_dedicated(const struct device *dev, uint32_t channel)
 {
 	uint8_t ch_int_flag;
 	uint8_t saved_ch_id;
@@ -402,7 +428,7 @@ static void dma_mchp_isr_dedicated(const struct device *dev, uint32_t channel)
 }
 
 /* ISR for shared IRQ line - multiple channels share one IRQ */
-static void dma_mchp_isr_shared(const struct device *dev)
+static __always_inline void dma_mchp_isr_shared(const struct device *dev)
 {
 	uint16_t int_pend;
 	uint32_t channel;
@@ -781,6 +807,9 @@ static int dma_mchp_init(const struct device *dev)
 	/* Initialize DMA descriptors */
 	dmac_desc_init(dev);
 
+	/* Initialize GPIO for ISR profiling */
+	PROFILE_GPIO_INIT();
+
 	/* Set default priority levels */
 	DMAC_REG->DMAC_PRICTRL0 = DMAC_PRICTRL0_LVLPRI0(0) | DMAC_PRICTRL0_LVLPRI1(1) |
 				  DMAC_PRICTRL0_LVLPRI2(2) | DMAC_PRICTRL0_LVLPRI3(3);
@@ -815,6 +844,24 @@ static DEVICE_API(dma, dma_mchp_api) = {
 #define DMA_MCHP_ISR_FUNC(idx, n)                                                                  \
 	static void dma_mchp_isr_##n##_##idx(const struct device *dev)                             \
 	{                                                                                          \
+		/* Test 1: find_lsb_set (bit 31) */                                                \
+		PROFILE_GPIO_HIGH();                                                               \
+		volatile uint32_t dummy = find_lsb_set(0x80000000);                                \
+		(void)dummy;                                                                       \
+		PROFILE_GPIO_LOW();                                                                \
+		/* Test 2: for-loop (bit 31 - worst case) */                                       \
+		PROFILE_GPIO_HIGH();                                                               \
+		volatile int bit_pos = -1;                                                         \
+		volatile uint32_t val = 0x80000000;                                                \
+		for (int i = 0; i < 32; i++) {                                                     \
+			if (val & BIT(i)) {                                                        \
+				bit_pos = i;                                                       \
+				break;                                                             \
+			}                                                                          \
+		}                                                                                  \
+		(void)bit_pos;                                                                     \
+		PROFILE_GPIO_LOW();                                                                \
+		/* Rest of ISR */                                                                  \
 		if ((idx) < NUM_DEDICATED_IRQS(n)) {                                               \
 			dma_mchp_isr_dedicated(dev, idx);                                          \
 		} else {                                                                           \
